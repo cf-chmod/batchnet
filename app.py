@@ -1,0 +1,154 @@
+import streamlit as st
+import tensorflow as tf
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.io import wavfile
+from IPython.display import Audio
+import tempfile
+import random
+import os
+
+
+# --- Utilidades ya conocidas ---
+def notes_to_frequencies(notes):
+    return 2 ** ((np.array(notes) - 69) / 12) * 440
+
+def frequencies_to_samples(frequencies, tempo, sample_rate):
+    note_duration = 60 / tempo
+    frequencies = (note_duration * frequencies).round() / note_duration
+    n_samples = int(note_duration * sample_rate)
+    time = np.linspace(0, note_duration, n_samples)
+    sine_waves = np.sin(2 * np.pi * frequencies.reshape(-1, 1) * time)
+    sine_waves *= (frequencies > 9.).reshape(-1, 1)
+    return sine_waves.reshape(-1)
+
+def chords_to_samples(chords, tempo, sample_rate):
+    freqs = notes_to_frequencies(chords)
+    freqs = np.r_[freqs, freqs[-1:]]
+    merged = np.mean([frequencies_to_samples(melody, tempo, sample_rate)
+                      for melody in freqs.T], axis=0)
+    n_fade_out_samples = sample_rate * 60 // tempo
+    fade_out = np.linspace(1., 0., n_fade_out_samples)**2
+    merged[-n_fade_out_samples:] *= fade_out
+    return merged
+
+def preprocess(window, min_note):
+    window = tf.where(window == 0, window, window - min_note + 1)
+    return tf.reshape(window, [-1])
+
+def generate_chorale(model, seed_chords, length, min_note, temperature=1.0):
+    arpegio = preprocess(tf.constant(seed_chords, dtype=tf.int64), min_note)
+    arpegio = tf.reshape(arpegio, [1, -1])
+    for chord in range(length):
+        for note in range(4):
+            next_note_probas = model.predict(arpegio, verbose=0)[0, -1:]
+            rescaled_logits = tf.math.log(next_note_probas) / temperature
+            next_note = tf.random.categorical(rescaled_logits, num_samples=1)
+            arpegio = tf.concat([arpegio, next_note], axis=1)
+    arpegio = tf.where(arpegio == 0, arpegio, arpegio + min_note - 1)
+    return tf.reshape(arpegio, shape=[-1, 4])
+
+def play_chords(chords, amplitude=0.1, tempo=160, sample_rate=44100):
+    samples = amplitude * chords_to_samples(chords, tempo, sample_rate)
+    samples = (2**15 * samples).astype(np.int16)
+    tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    wavfile.write(tmpfile.name, sample_rate, samples)
+    return tmpfile.name
+
+# --- Interfaz de Streamlit ---
+st.set_page_config(page_title="BachNet", layout="centered")
+
+st.title("🎼 Bach-Style Chorale Generator")
+st.write("This app generates chorales inspired by Bach's style and challenges you to guess which one is the original. It uses BachNet, the model we previously created in the Python Notebook.")
+st.markdown("[Go to Python Notebook](https://colab.research.google.com/drive/1OBTR_L9yrrpqIFC4oQtChwkD7opC887T#scrollTo=4I5kS5ViADED)")
+st.write("Click the button below to generate a new melody inspired by Bach's style.")
+
+# Cargar test
+def load_chorales(files):
+    chorales = []
+    for file in files:
+        df = pd.read_csv(file)
+        # Convertir cada fila (cada instante de tiempo) a una tupla de notas por voz
+        chords = [tuple(row) for row in df.values]
+        chorales.append(chords)
+    return chorales
+
+jsb_chorales_dir = Path("jsb_chorales")
+
+test_files = sorted(jsb_chorales_dir.glob("test/chorale_*.csv"))
+
+test_chorales = load_chorales(test_files)
+
+# Cargar modelo
+@st.cache_resource
+def load_model():
+    return tf.keras.models.load_model("my_bach_model.keras")
+
+model = load_model()
+min_note = 36
+
+# Leer seed
+@st.cache_data
+def load_seed_chords():
+    jsb_chorales_dir = Path("jsb_chorales")
+    test_files = sorted(jsb_chorales_dir.glob("test/chorale_*.csv"))
+    index = random.randint(0, len(test_files) - 1)
+    seed_chords = pd.read_csv(test_files[index]).values.tolist()[:8]
+    return seed_chords
+
+seed_chords = load_seed_chords()
+
+temperature = st.slider("Generation Temperature", 0.5, 1.5, 1.0, 0.1)
+
+if st.button("🎵 Generate New Melody"):
+    with st.spinner("Generating music..."):
+        new_chorale = generate_chorale(model, seed_chords, length=56, min_note=min_note, temperature=temperature)
+        wav_path = play_chords(new_chorale, amplitude=0.2)
+        st.audio(wav_path, format='audio/wav')
+
+# @st.cache_data
+def get_seed_and_generated():
+    index = random.randint(0, len(test_chorales) - 1)
+    seed_chords = test_chorales[index][:8]
+    original = test_chorales[index][:64]
+    generated = generate_chorale(model, seed_chords, 56, min_note).numpy().tolist()
+    return original, generated
+
+def save_audio(chords, filename="temp.wav"):
+    samples = chords_to_samples(chords, tempo=160, sample_rate=44100)
+    samples = (2**15 * 0.2 * samples).astype(np.int16)
+    wavfile.write(filename, 44100, samples)
+    return filename
+
+st.divider()
+
+st.title("🎵 Guess the Original Melody")
+st.write("Listen to both versions below. One is a real Bach chorale, and the other was generated by BachNet. Try and guess which is which")
+
+if st.button("🎲 Generate New Challenge"):
+    with st.spinner("Generating challenge..."):
+        st.session_state['original'], st.session_state['generated'] = get_seed_and_generated()
+        st.session_state['shuffled'] = random.sample(['original', 'generated'], 2)
+        st.session_state['respuesta'] = None
+
+# Mostrar botones solo si se generó un reto
+if 'shuffled' in st.session_state:
+    st.subheader("Listen to the two melodies and choose which one you think is the original:")
+    
+    cols = st.columns(2)
+    for i, version in enumerate(st.session_state['shuffled']):
+        audio_file = save_audio(st.session_state[version], f"melody_{i}.wav")
+        with cols[i]:
+            st.audio(audio_file)
+            if st.button(f"Choose Melody {i + 1}"):
+                if version == 'original':
+                    st.session_state['respuesta'] = "✅ Correct! That was the original."
+                else:
+                    st.session_state['respuesta'] = "❌ Incorrect. That was generated by BachNet."
+
+if 'respuesta' in st.session_state:
+    if st.session_state['respuesta']==None:
+        st.session_state['respuesta'] = "❓ Please select a melody to see if you are correct."
+    else:
+        st.markdown(f"### {st.session_state['respuesta']}")
